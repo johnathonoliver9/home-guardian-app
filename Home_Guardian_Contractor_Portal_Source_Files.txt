@@ -1,0 +1,1059 @@
+HOME GUARDIAN CONTRACTOR PORTAL — SOURCE CODE REFERENCE
+This is a readable, non-ZIP copy of the application source. Use the ZIP for uploading/deploying because this text file does not preserve separate project files.
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/next-env.d.ts
+======================================================================
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/cron/deliver/route.ts
+======================================================================
+import {db} from '../../../../lib/server';
+export async function GET(req:Request){
+ if(!process.env.CRON_SECRET||req.headers.get('authorization')!==`Bearer ${process.env.CRON_SECRET}`)return new Response('Unauthorized',{status:401});
+ if(!process.env.RESEND_API_KEY||!process.env.NOTIFICATION_FROM_EMAIL)return Response.json({error:'Email provider not configured'},{status:503});
+ const client=db();
+ const {data:batch,error}=await client.rpc('lease_notification_batch',{p_limit:40});
+ if(error)return Response.json({error:'Could not lease notification batch'},{status:500});
+ let sent=0,failed=0;
+ for(const job of batch||[]){
+  try{
+   // Resolve email from trusted Auth database, not contractor-controlled profile text.
+   const {data:user,error:lookupError}=await client.auth.admin.getUserById(job.recipient_id);
+   if(lookupError||!user?.user?.email)throw new Error('Recipient email unavailable');
+   const res=await fetch('https://api.resend.com/emails',{method:'POST',headers:{
+    Authorization:`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json',
+    'Idempotency-Key':job.event_key
+   },body:JSON.stringify({from:process.env.NOTIFICATION_FROM_EMAIL,to:[user.user.email],subject:job.subject,text:job.body})});
+   if(!res.ok)throw new Error(`Provider returned ${res.status}`);
+   await client.from('notification_outbox').update({status:'sent',delivered_at:new Date().toISOString(),lease_until:null,last_error:null}).eq('id',job.id).eq('status','processing').eq('attempts',job.attempts);
+   sent++;
+  }catch(e){
+   const attempts=Number(job.attempts);
+   const backoffMinutes=Math.min(360,Math.pow(2,attempts));
+   await client.from('notification_outbox').update({
+    status:attempts>=8?'failed':'pending',lease_until:null,
+    next_attempt_at:new Date(Date.now()+backoffMinutes*60000).toISOString(),
+    last_error:String(e).slice(0,200)
+   }).eq('id',job.id).eq('status','processing').eq('attempts',job.attempts);
+   failed++;
+  }
+ }
+ return Response.json({leased:(batch||[]).length,sent,failed});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/cron/reminders/route.ts
+======================================================================
+import {db} from '../../../../lib/server';
+export async function GET(req:Request){if(!process.env.CRON_SECRET||req.headers.get('authorization')!==`Bearer ${process.env.CRON_SECRET}`)return new Response('Unauthorized',{status:401});
+ const today=new Date().toISOString().slice(0,10);const soon=new Date(Date.now()+7*86400000).toISOString().slice(0,10);
+ const {data:tasks,error}=await db().from('maintenance_tasks').select('id,user_id,title,next_due').lte('next_due',soon).limit(1000);
+ if(error)return Response.json({error:error.message},{status:500});let count=0;
+ for(const task of tasks||[]){const {data:m}=await db().from('memberships').select('status,paid_through').eq('user_id',task.user_id).maybeSingle();if(!m||!['active','trialing'].includes(m.status)||!m.paid_through||new Date(m.paid_through)<=new Date())continue;
+ const days=Math.round((Date.parse(task.next_due)-Date.parse(today))/86400000);const title=days<0?'Overdue maintenance':days===0?'Maintenance due today':'Upcoming maintenance';
+ const {error:e}=await db().from('notifications').upsert({user_id:task.user_id,task_id:task.id,reminder_date:today,title,body:`${task.title}: ${days<0?'overdue':days===0?'due today':`due in ${days} days`}.`},{onConflict:'task_id,reminder_date'});if(!e)count++;
+ }
+ return Response.json({processed:count});}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/stripe/webhook/route.ts
+======================================================================
+import Stripe from 'stripe';
+import {db,stripe} from '../../../../lib/server';
+export async function POST(req:Request){
+ const sig=req.headers.get('stripe-signature');if(!sig)return new Response('Missing signature',{status:400});
+ let event:Stripe.Event;
+ try{event=stripe().webhooks.constructEvent(await req.text(),sig,process.env.STRIPE_WEBHOOK_SECRET!)}catch{return new Response('Invalid signature',{status:400})}
+ if(event.type==='checkout.session.completed'){
+   const s=event.data.object as Stripe.Checkout.Session;
+   if(s.mode==='subscription'&&s.subscription&&s.client_reference_id){
+     const sub=await stripe().subscriptions.retrieve(s.subscription as string);
+     await sync(sub,s.client_reference_id);
+   }
+ }
+ if(event.type==='customer.subscription.updated'||event.type==='customer.subscription.deleted'){
+   const sub=event.data.object as Stripe.Subscription;
+   const userId=sub.metadata.user_id;
+   if(userId)await sync(sub,userId);
+ }
+ return Response.json({received:true});
+}
+async function sync(sub:Stripe.Subscription,userId:string){
+ const item=sub.items.data[0];const paidThrough=item?.current_period_end?new Date(item.current_period_end*1000).toISOString():null;
+ const plan=sub.metadata.plan==='annual'?'annual':'monthly';
+ const {error}=await db().from('memberships').upsert({user_id:userId,stripe_subscription_id:sub.id,status:sub.status,plan,paid_through:paidThrough,updated_at:new Date().toISOString()},{onConflict:'user_id'});
+ if(error)throw error;
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/contractor/reopen/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../../lib/server';
+export async function POST(req:Request){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const body=await req.json().catch(()=>null);
+ if(!Number.isSafeInteger(body?.requestId)||body.requestId<1)return Response.json({error:'Invalid request ID'},{status:400});
+ const {data,error}=await db().rpc('reopen_repair',{p_request_id:body.requestId,p_actor_id:user.id});
+ if(error)return Response.json({error:'Not authorized or request unavailable'},{status:409});
+ return Response.json({reopened:true,contractorsNotifiedInApp:data});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/contractor/claim/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../../lib/server';
+export async function POST(req:Request){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const body=await req.json().catch(()=>null);
+ if(!Number.isSafeInteger(body?.requestId)||body.requestId<1)return Response.json({error:'Invalid request ID'},{status:400});
+ const {data,error}=await db().rpc('claim_repair',{p_request_id:body.requestId,p_contractor_id:user.id});
+ if(error)return Response.json({error:'Assignment failed'},{status:500});
+ if(!data)return Response.json({error:'Request unavailable, already assigned, or contractor ineligible'},{status:409});
+ return Response.json({assigned:true,requestId:body.requestId});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/contractor/alerts/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../../lib/server';
+export async function GET(req:Request){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const {data,error}=await db().from('contractor_alerts').select('id,request_id,event_type,created_at,read_at').eq('contractor_id',user.id).order('created_at',{ascending:false}).limit(50);
+ if(error)return Response.json({error:'Database error'},{status:500});
+ return Response.json({alerts:data});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/contractor/assignments/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../../lib/server';
+export async function GET(req:Request){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const database=db();
+ const {data:contractor,error:ce}=await database.from('contractors').select('approved').eq('user_id',user.id).maybeSingle();
+ if(ce)return Response.json({error:'Unable to verify contractor'},{status:500});
+ if(!contractor?.approved)return Response.json({error:'Approved contractor required'},{status:403});
+ const {data:assignments,error}=await database.from('repair_assignments').select('request_id,assigned_at').eq('contractor_id',user.id).order('assigned_at',{ascending:false}).limit(100);
+ if(error)return Response.json({error:'Unable to load assignments'},{status:500});
+ const ids=(assignments||[]).map(a=>a.request_id);
+ if(!ids.length)return Response.json({assignments:[]},{headers:{'Cache-Control':'no-store'}});
+ const {data:requests,error:re}=await database.from('repair_requests').select('id,trade,description,status,created_at,service_area').in('id',ids);
+ if(re)return Response.json({error:'Unable to load work orders'},{status:500});
+ const byId=new Map((requests||[]).map(r=>[r.id,r]));
+ return Response.json({assignments:(assignments||[]).map(a=>({...a,request:byId.get(a.request_id)||null})).filter(a=>a.request)},{headers:{'Cache-Control':'no-store'}});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/contractor/profile/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../../lib/server';
+export async function GET(req:Request){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const {data,error}=await db().from('contractors').select('user_id,approved,trade,service_area').eq('user_id',user.id).maybeSingle();
+ if(error)return Response.json({error:'Unable to load contractor profile'},{status:500});
+ if(!data)return Response.json({error:'No contractor profile found. Contact Home Guardian management for onboarding.'},{status:403});
+ return Response.json({contractor:data},{headers:{'Cache-Control':'no-store'}});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/contractor/opportunities/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../../lib/server';
+export async function GET(req:Request){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const database=db();
+ const {data:contractor,error:ce}=await database.from('contractors').select('approved,trade,service_area').eq('user_id',user.id).maybeSingle();
+ if(ce)return Response.json({error:'Database error'},{status:500});
+ if(!contractor?.approved)return Response.json({error:'Approved contractor required'},{status:403});
+ const {data,error}=await database.from('repair_requests').select('id,trade,description,created_at,status').eq('status','open').eq('trade',contractor.trade).eq('service_area',contractor.service_area).order('created_at',{ascending:false}).limit(50);
+ if(error)return Response.json({error:'Database error'},{status:500});
+ // Do not expose homeowner contact details or identity in public opportunities.
+ return Response.json({opportunities:data});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/notifications/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../lib/server';
+export async function GET(req:Request){const u=await currentUser(req);if(!u)return unauthorized();const {data,error}=await db().from('notifications').select('id,title,body,created_at,read_at').eq('user_id',u.id).order('created_at',{ascending:false}).limit(50);return error?Response.json({error:error.message},{status:500}):Response.json({notifications:data});}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/requests/route.ts
+======================================================================
+import {currentUser,db,isActive,unauthorized} from '../../../lib/server';
+export async function POST(req:Request){const u=await currentUser(req);if(!u)return unauthorized();if(!await isActive(u.id))return Response.json({error:'Active paid membership required'},{status:403});const {trade,description,service_area}=await req.json();if(!['plumbing','hvac','electrical','roofing','general'].includes(trade)||typeof description!=='string'||description.trim().length<10||description.length>2000||typeof service_area!=='string'||service_area.trim().length<2||service_area.length>100)return Response.json({error:'Invalid repair request'},{status:400});const {data,error}=await db().from('repair_requests').insert({user_id:u.id,trade,description:description.trim(),service_area:service_area.trim()}).select('id,status').single();if(error)return Response.json({error:error.message},{status:500});return Response.json(data,{status:201});}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/requests/[id]/messages/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../../../lib/server';
+function validId(value:string){const id=Number(value);return Number.isSafeInteger(id)&&id>0?id:null}
+export async function GET(req:Request,{params}:{params:Promise<{id:string}>}){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const id=validId((await params).id);if(!id)return Response.json({error:'Invalid ID'},{status:400});
+ const {data,error}=await db().rpc('read_repair_messages',{p_request_id:id,p_reader_id:user.id,p_limit:100});
+ if(error)return Response.json({error:'Access denied or assignment changed'},{status:403});
+ return Response.json({messages:[...(data||[])].reverse()},{headers:{'Cache-Control':'no-store'}});
+}
+export async function POST(req:Request,{params}:{params:Promise<{id:string}>}){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const id=validId((await params).id);if(!id)return Response.json({error:'Invalid ID'},{status:400});
+ const body=await req.json().catch(()=>null);
+ if(typeof body?.message!=='string'||!body.message.trim()||body.message.length>2000)return Response.json({error:'Invalid message'},{status:400});
+ const {data,error}=await db().rpc('send_repair_message',{p_request_id:id,p_sender_id:user.id,p_body:body.message.trim()});
+ if(error)return Response.json({error:'Access denied or assignment changed'},{status:409});
+ return Response.json({id:data},{status:201});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/admin/reopen/route.ts
+======================================================================
+import {requireAdmin} from '../../../../lib/admin';
+import {db} from '../../../../lib/server';
+export async function POST(req:Request){
+ const auth=await requireAdmin(req);if(auth.error)return auth.error;
+ const body=await req.json().catch(()=>null);
+ if(!Number.isSafeInteger(body?.requestId)||body.requestId<1)return Response.json({error:'Invalid request ID'},{status:400});
+ const {data,error}=await db().rpc('reopen_repair',{p_request_id:body.requestId,p_actor_id:auth.user!.id});
+ if(error)return Response.json({error:'Request not assigned or reassignment failed'},{status:409});
+ return Response.json({reopened:true,inAppAlertsCreated:data});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/admin/overview/route.ts
+======================================================================
+import {requireAdmin} from '../../../../lib/admin';
+import {db} from '../../../../lib/server';
+export async function GET(req:Request){
+ const auth=await requireAdmin(req);if(auth.error)return auth.error;
+ const client=db();
+ const [members,active,contractors,pending,requests,open,assigned,recent]=await Promise.all([
+  client.from('memberships').select('*',{count:'exact',head:true}),
+  client.from('memberships').select('*',{count:'exact',head:true}).in('status',['active','trialing']).gt('paid_through',new Date().toISOString()),
+  client.from('contractors').select('*',{count:'exact',head:true}),
+  client.from('contractors').select('*',{count:'exact',head:true}).eq('approved',false),
+  client.from('repair_requests').select('*',{count:'exact',head:true}),
+  client.from('repair_requests').select('*',{count:'exact',head:true}).eq('status','open'),
+  client.from('repair_requests').select('*',{count:'exact',head:true}).eq('status','assigned'),
+  client.from('repair_requests').select('id,trade,service_area,status,created_at').order('created_at',{ascending:false}).limit(15)
+ ]);
+ const failures=[members,active,contractors,pending,requests,open,assigned,recent].filter(x=>x.error);
+ if(failures.length)return Response.json({error:'Unable to load dashboard'},{status:500});
+ return Response.json({metrics:{members:members.count,activeMembers:active.count,contractors:contractors.count,pendingContractors:pending.count,requests:requests.count,openRequests:open.count,assignedRequests:assigned.count},recentRequests:recent.data},{headers:{'Cache-Control':'no-store'}});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/admin/requests/route.ts
+======================================================================
+import {requireAdmin} from '../../../../lib/admin';
+import {db} from '../../../../lib/server';
+export async function GET(req:Request){
+ const auth=await requireAdmin(req);if(auth.error)return auth.error;
+ const url=new URL(req.url),page=Math.max(1,Number(url.searchParams.get('page'))||1),status=url.searchParams.get('status');
+ if(page>10000||status&&!['open','assigned'].includes(status))return Response.json({error:'Invalid filters'},{status:400});
+ let query=db().from('repair_requests').select('id,trade,description,status,service_area,created_at,repair_assignments(contractor_id,assigned_at)',{count:'exact'});
+ if(status)query=query.eq('status',status);
+ const {data,error,count}=await query.order('created_at',{ascending:false}).range((page-1)*25,page*25-1);
+ if(error)return Response.json({error:'Unable to list requests'},{status:500});
+ return Response.json({items:data,total:count,page},{headers:{'Cache-Control':'no-store'}});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/admin/history/route.ts
+======================================================================
+import {requireAdmin} from '../../../../lib/admin';
+import {db} from '../../../../lib/server';
+export async function GET(req:Request){
+ const auth=await requireAdmin(req);if(auth.error)return auth.error;
+ const page=Math.max(1,Math.min(10000,Number(new URL(req.url).searchParams.get('page'))||1));
+ const {data,error,count}=await db().from('contractor_assignment_history').select('id,request_id,contractor_id,action,actor_id,occurred_at',{count:'exact'}).order('occurred_at',{ascending:false}).range((page-1)*25,page*25-1);
+ if(error)return Response.json({error:'Unable to load history'},{status:500});
+ return Response.json({items:data,total:count,page},{headers:{'Cache-Control':'no-store'}});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/admin/contractors/route.ts
+======================================================================
+import {requireAdmin} from '../../../../lib/admin';
+import {db} from '../../../../lib/server';
+export async function GET(req:Request){
+ const auth=await requireAdmin(req);if(auth.error)return auth.error;
+ const page=Math.max(1,Math.min(10000,Number(new URL(req.url).searchParams.get('page'))||1));
+ const {data,error,count}=await db().from('contractors').select('user_id,approved,trade,service_area,created_at',{count:'exact'}).order('created_at',{ascending:false}).range((page-1)*25,page*25-1);
+ if(error)return Response.json({error:'Unable to list contractors'},{status:500});
+ return Response.json({items:data,total:count,page},{headers:{'Cache-Control':'no-store'}});
+}
+export async function PATCH(req:Request){
+ const auth=await requireAdmin(req);if(auth.error)return auth.error;
+ const body=await req.json().catch(()=>null);
+ if(!body||typeof body.contractorId!=='string'||typeof body.approved!=='boolean'||!/^[0-9a-f-]{36}$/i.test(body.contractorId))return Response.json({error:'Invalid request'},{status:400});
+ const {data,error}=await db().rpc('set_contractor_approval',{p_actor_id:auth.user!.id,p_contractor_id:body.contractorId,p_approved:body.approved});
+ if(error)return Response.json({error:'Approval change failed'},{status:409});
+ if(!data)return Response.json({error:'Contractor not found'},{status:404});
+ return Response.json({updated:true});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/admin/audit/route.ts
+======================================================================
+import {requireAdmin} from '../../../../lib/admin';
+import {db} from '../../../../lib/server';
+export async function GET(req:Request){
+ const auth=await requireAdmin(req);if(auth.error)return auth.error;
+ const page=Math.max(1,Math.min(10000,Number(new URL(req.url).searchParams.get('page'))||1));
+ const {data,error,count}=await db().from('admin_audit_logs').select('id,actor_id,action,target_type,target_id,details,occurred_at',{count:'exact'}).order('occurred_at',{ascending:false}).range((page-1)*25,page*25-1);
+ if(error)return Response.json({error:'Unable to load audit log'},{status:500});
+ return Response.json({items:data,total:count,page},{headers:{'Cache-Control':'no-store'}});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/checkout/route.ts
+======================================================================
+import {currentUser,stripe,unauthorized} from '../../../lib/server';
+export async function POST(req:Request){
+ const user=await currentUser(req);if(!user)return unauthorized();
+ const {plan}=await req.json();if(plan!=='monthly'&&plan!=='annual')return Response.json({error:'Invalid plan'},{status:400});
+ const price=plan==='annual'?process.env.STRIPE_ANNUAL_PRICE_ID:process.env.STRIPE_MONTHLY_PRICE_ID;
+ if(!price)return Response.json({error:'Price not configured'},{status:500});
+ const session=await stripe().checkout.sessions.create({mode:'subscription',customer_email:user.email,client_reference_id:user.id,line_items:[{price,quantity:1}],subscription_data:{metadata:{user_id:user.id,plan}},success_url:`${process.env.APP_URL}/?checkout=success`,cancel_url:`${process.env.APP_URL}/?checkout=cancel`});
+ return Response.json({url:session.url});
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/api/profile/route.ts
+======================================================================
+import {currentUser,db,unauthorized} from '../../../lib/server';
+import {schedule,HomeInput} from '../../../lib/schedule';
+export async function GET(req:Request){const u=await currentUser(req);if(!u)return unauthorized();const [p,m,t]=await Promise.all([db().from('homes').select('*').eq('user_id',u.id).maybeSingle(),db().from('memberships').select('status,plan,paid_through').eq('user_id',u.id).maybeSingle(),db().from('maintenance_tasks').select('*').eq('user_id',u.id).order('next_due')]);return Response.json({home:p.data,membership:m.data,tasks:t.data||[]})}
+export async function POST(req:Request){const u=await currentUser(req);if(!u)return unauthorized();const x=await req.json() as HomeInput;
+ if(!Number.isInteger(x.year_built)||x.year_built<1800||x.year_built>new Date().getFullYear()+1||!['central','heat_pump','other'].includes(x.hvac_type)||!['tank','tankless','other'].includes(x.heater_type)||typeof x.gutters!=='boolean'||![x.filter_last_changed,x.heater_last_serviced].every(d=>/^\d{4}-\d{2}-\d{2}$/.test(d)&&!isNaN(Date.parse(d))&&Date.parse(d)<=Date.now()))return Response.json({error:'Invalid home details'},{status:400});
+ const {error}=await db().from('homes').upsert({...x,user_id:u.id},{onConflict:'user_id'});if(error)return Response.json({error:error.message},{status:500});
+ const tasks=schedule(x).map(t=>({...t,user_id:u.id}));const result=await db().from('maintenance_tasks').upsert(tasks,{onConflict:'user_id,code'});if(result.error)return Response.json({error:result.error.message},{status:500});return Response.json({tasks});}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/page.tsx
+======================================================================
+'use client';
+import {useState} from 'react';
+import {createClient} from '@supabase/supabase-js';
+const auth=createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!,process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!);
+type Task={code:string;title:string;next_due:string;instructions:string};
+export default function Home(){
+ const [email,setEmail]=useState(''),[password,setPassword]=useState(''),[message,setMessage]=useState(''),[profile,setProfile]=useState<any>(null),[trade,setTrade]=useState('plumbing'),[repair,setRepair]=useState('');
+ const [home,setHome]=useState({year_built:2000,hvac_type:'central',filter_last_changed:new Date().toISOString().slice(0,10),heater_type:'tank',heater_last_serviced:new Date().toISOString().slice(0,10),gutters:true});
+ async function api(path:string,body?:unknown){const {data}=await auth.auth.getSession();if(!data.session)throw Error('Sign in first');const res=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json',Authorization:`Bearer ${data.session.access_token}`},body:body?JSON.stringify(body):undefined});const json=await res.json();if(!res.ok)throw Error(json.error||'Request failed');return json}
+ async function run(fn:()=>Promise<void>){try{setMessage('Working...');await fn();setMessage('Done')}catch(e){setMessage(e instanceof Error?e.message:'Unexpected error')}}
+ async function refresh(){setProfile(await api('profile'))}
+ const field=(label:string,value:string|number,onChange:(s:string)=>void,type='text')=><label style={{display:'grid',gap:5,marginBottom:12}}>{label}<input type={type} value={value} onChange={e=>onChange(e.target.value)} style={{padding:10,border:'1px solid #cad5e2',borderRadius:8}}/></label>;
+ const button=(label:string,onClick:()=>void)=><button onClick={onClick} style={{padding:'11px 15px',background:'#184c7c',color:'white',border:0,borderRadius:9,margin:'5px 7px 5px 0',cursor:'pointer'}}>{label}</button>;
+ return <main style={{maxWidth:760,margin:'auto',padding:24}}><header style={{background:'#163e66',color:'white',padding:24,borderRadius:16}}><h1 style={{margin:0}}>Home Guardian</h1><p>Membership • Guided maintenance • Repair requests</p></header>
+ <section style={section}><h2>1. Sign in or create account</h2>{field('Email',email,setEmail,'email')}{field('Password',password,setPassword,'password')}{button('Create account',()=>run(async()=>{const {error}=await auth.auth.signUp({email,password});if(error)throw error;setMessage('Account created. Confirm email if required, then sign in.')}))}{button('Sign in',()=>run(async()=>{const {error}=await auth.auth.signInWithPassword({email,password});if(error)throw error;await refresh()}))}{button('Refresh membership',()=>run(refresh))}</section>
+ <section style={section}><h2>2. Paid membership</h2><p>Status: <b>{profile?.membership?.status||'Not verified'}</b></p><p>Choose monthly or annual billing to unlock repair requests.</p>{button('Monthly checkout',()=>run(async()=>{const {url}=await api('checkout',{plan:'monthly'});location.href=url}))}{button('Annual checkout',()=>run(async()=>{const {url}=await api('checkout',{plan:'annual'});location.href=url}))}</section>
+ <section style={section}><h2>3. Guided home setup</h2><p>Tell us about your home. Home Guardian generates recommended tasks.</p>{field('Year built',home.year_built,s=>setHome({...home,year_built:Number(s)}),'number')}<label>HVAC type <select value={home.hvac_type} onChange={e=>setHome({...home,hvac_type:e.target.value})}><option value="central">Central</option><option value="heat_pump">Heat pump</option><option value="other">Other</option></select></label>{field('Last air filter change',home.filter_last_changed,s=>setHome({...home,filter_last_changed:s}),'date')}<p>Water heater type <select value={home.heater_type} onChange={e=>setHome({...home,heater_type:e.target.value})}><option value="tank">Tank</option><option value="tankless">Tankless</option><option value="other">Other</option></select></p>{field('Last water heater service',home.heater_last_serviced,s=>setHome({...home,heater_last_serviced:s}),'date')}<label><input type="checkbox" checked={home.gutters} onChange={e=>setHome({...home,gutters:e.target.checked})}/> Home has gutters</label><div>{button('Save home and generate reminders',()=>run(async()=>{await api('profile',home);await refresh()}))}</div></section>
+ <section style={section}><h2>4. Maintenance reminders</h2>{(profile?.tasks||[]).map((t:Task)=><article key={t.code} style={{borderTop:'1px solid #ddd',padding:'12px 0'}}><b>{t.title}</b><p>Next due: {t.next_due}</p><small>{t.instructions}</small></article>)}{button('Refresh reminders',()=>run(refresh))}{button('View notification inbox',()=>run(async()=>{const x=await api('notifications');setMessage(JSON.stringify(x.notifications))}))}</section>
+ <section style={section}><h2>5. Request a contractor</h2><p>Only verified active paid members can submit repair requests.</p><select value={trade} onChange={e=>setTrade(e.target.value)}>{['plumbing','hvac','electrical','roofing','general'].map(t=><option key={t}>{t}</option>)}</select><textarea placeholder="Describe the repair" value={repair} onChange={e=>setRepair(e.target.value)} style={{display:'block',width:'95%',height:90,marginTop:10,padding:10}}/>{button('Submit repair request',()=>run(async()=>{const r=await api('requests',{trade,description:repair});setMessage('Repair request created: '+r.id)}))}</section><p role="status">{message}</p></main>
+}
+const section:React.CSSProperties={background:'white',borderRadius:14,padding:22,marginTop:18,boxShadow:'0 1px 4px #0001'};
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/contractor/page.tsx
+======================================================================
+'use client';
+import {useCallback,useEffect,useState} from 'react';
+import {createClient, type Session} from '@supabase/supabase-js';
+
+type Contractor={approved:boolean;trade:string;service_area:string};
+type Job={id:number;trade:string;description:string;status:string;created_at:string;service_area?:string};
+type Assignment={request_id:number;assigned_at:string;request:Job};
+type Alert={id:number;request_id:number;event_type:string;created_at:string;read_at:string|null};
+type Message={id:number;sender_id:string;body:string;created_at:string};
+const auth=createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!,process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,{auth:{persistSession:true,autoRefreshToken:true}});
+const panel:React.CSSProperties={background:'#fff',borderRadius:14,padding:20,marginTop:18,boxShadow:'0 2px 12px #12263d12'};
+const action:React.CSSProperties={background:'#174b79',color:'white',padding:'10px 15px',border:0,borderRadius:8,cursor:'pointer',marginRight:8,marginTop:8};
+export default function ContractorPage(){
+ const [session,setSession]=useState<Session|null>(null),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[busy,setBusy]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState('');
+ const [profile,setProfile]=useState<Contractor|null>(null),[opportunities,setOpportunities]=useState<Job[]>([]),[assignments,setAssignments]=useState<Assignment[]>([]),[alerts,setAlerts]=useState<Alert[]>([]);
+ const [selected,setSelected]=useState<number|null>(null),[messages,setMessages]=useState<Message[]>([]),[draft,setDraft]=useState('');
+ useEffect(()=>{let active=true;auth.auth.getSession().then(({data})=>{if(active)setSession(data.session)});const {data:{subscription}}=auth.auth.onAuthStateChange((_event,s)=>{if(active)setSession(s)});return()=>{active=false;subscription.unsubscribe()}},[]);
+ const api=useCallback(async(path:string,method='GET',body?:unknown)=>{
+  const {data:{session:current},error:sessionError}=await auth.auth.getSession();if(sessionError||!current)throw Error('Please sign in again');
+  const response=await fetch('/api/'+path,{method,headers:{Authorization:`Bearer ${current.access_token}`,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});
+  const result=await response.json();if(!response.ok)throw Error(result.error||'Request failed');return result;
+ },[]);
+ const refresh=useCallback(async()=>{
+  setError('');try{
+   const p=await api('contractor/profile');setProfile(p.contractor);
+   if(!p.contractor.approved){setOpportunities([]);setAssignments([]);setAlerts([]);return}
+   const [o,a,n]=await Promise.all([api('contractor/opportunities'),api('contractor/assignments'),api('contractor/alerts')]);
+   setOpportunities(o.opportunities||[]);setAssignments(a.assignments||[]);setAlerts(n.alerts||[]);
+  }catch(e){setError(e instanceof Error?e.message:'Unable to load dashboard')}
+ },[api]);
+ useEffect(()=>{if(session){void refresh()}else{setProfile(null);setOpportunities([]);setAssignments([]);setMessages([]);setSelected(null)}},[session?.user.id,refresh]);
+ async function perform(work:()=>Promise<void>){setBusy(true);setError('');setNotice('');try{await work()}catch(e){setError(e instanceof Error?e.message:'Unexpected error')}finally{setBusy(false)}}
+ async function openMessages(id:number){await perform(async()=>{const result=await api(`requests/${id}/messages`);setSelected(id);setMessages(result.messages||[])})}
+ async function claim(id:number){await perform(async()=>{await api('contractor/claim','POST',{requestId:id});setNotice(`Work order #${id} accepted`);await refresh()})}
+ async function decline(id:number){if(!window.confirm(`Decline work order #${id}? You will lose access to its messages and it will become available to other contractors.`))return;await perform(async()=>{await api('contractor/reopen','POST',{requestId:id});if(selected===id){setSelected(null);setMessages([])}setNotice(`Work order #${id} declined and reopened`);await refresh()})}
+ async function send(){if(!selected||!draft.trim())return;await perform(async()=>{await api(`requests/${selected}/messages`,'POST',{message:draft.trim()});setDraft('');const result=await api(`requests/${selected}/messages`);setMessages(result.messages||[]);setNotice('Message sent')})}
+ return <main style={{maxWidth:1020,margin:'auto',padding:'24px 16px',color:'#182b3e',fontFamily:'Arial, sans-serif'}}>
+  <header style={{background:'#123b61',color:'white',padding:24,borderRadius:14}}><h1 style={{margin:'0 0 6px'}}>Home Guardian | Contractor Portal</h1><div>Job opportunities, assignments and secure homeowner messages</div></header>
+  {!session?<section style={panel}><h2>Contractor sign in</h2><p>Use the email and password for your approved Home Guardian contractor account.</p><form onSubmit={e=>{e.preventDefault();void perform(async()=>{const {error}=await auth.auth.signInWithPassword({email,password});if(error)throw error;setPassword('')})}}><label style={{display:'block',marginBottom:12}}>Email<br/><input required type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} style={{padding:10,width:'min(100%,360px)'}}/></label><label>Password<br/><input required type="password" autoComplete="current-password" value={password} onChange={e=>setPassword(e.target.value)} style={{padding:10,width:'min(100%,360px)'}}/></label><div><button style={action} disabled={busy}>Sign in</button></div></form></section>:
+  <><section style={panel}><div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:10}}><div><h2 style={{marginBottom:4}}>Contractor dashboard</h2><span>{session.user.email}</span>{profile&&<p>Trade: <b>{profile.trade}</b> | Service area: <b>{profile.service_area}</b> | {profile.approved?'Approved':'Awaiting approval'}</p>}</div><div><button style={action} disabled={busy} onClick={()=>void refresh()}>Refresh jobs</button><button style={{...action,background:'#526273'}} onClick={()=>void auth.auth.signOut()}>Sign out</button></div></div></section>
+  {profile?.approved?<><section style={panel}><h2>Available jobs ({opportunities.length})</h2><p>Only jobs matching your approved trade and service area appear here. A job can be claimed by only one contractor.</p>{!opportunities.length&&<p>No available jobs at this time.</p>}{opportunities.map(j=><article key={j.id} style={{padding:'14px 0',borderTop:'1px solid #e4e8ed'}}><b>Work order #{j.id} · {j.trade}</b><p style={{whiteSpace:'pre-wrap'}}>{j.description}</p><small>Requested {new Date(j.created_at).toLocaleString()}</small><div><button disabled={busy} style={action} onClick={()=>void claim(j.id)}>Accept job</button></div></article>)}</section>
+  <section style={panel}><h2>My assigned jobs ({assignments.length})</h2>{!assignments.length&&<p>You have no active assignments.</p>}{assignments.map(a=><article key={a.request_id} style={{padding:'14px 0',borderTop:'1px solid #e4e8ed'}}><b>Work order #{a.request_id} · {a.request.trade}</b><p style={{whiteSpace:'pre-wrap'}}>{a.request.description}</p><small>Status: {a.request.status} · Assigned {new Date(a.assigned_at).toLocaleString()}</small><div><button disabled={busy} style={action} onClick={()=>void openMessages(a.request_id)}>Message homeowner</button><button disabled={busy} style={{...action,background:'#8a3838'}} onClick={()=>void decline(a.request_id)}>Decline assignment</button></div></article>)}</section>
+  <section style={panel}><h2>Homeowner messages {selected?`· Work order #${selected}`:''}</h2>{selected?<><div aria-live="polite" style={{maxHeight:330,overflowY:'auto',background:'#f3f6f9',padding:14,borderRadius:8}}>{!messages.length&&<p>No messages yet.</p>}{messages.map((m,i)=><div key={m.id??i} style={{padding:10,marginBottom:8,background:'white',borderRadius:8}}><small>{m.sender_id===session.user.id?'You':'Homeowner'} · {new Date(m.created_at).toLocaleString()}</small><p style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere',marginBottom:0}}>{m.body}</p></div>)}</div><label style={{display:'block',marginTop:12}}>Your message<textarea maxLength={2000} rows={3} value={draft} onChange={e=>setDraft(e.target.value)} style={{display:'block',width:'100%',boxSizing:'border-box',padding:10,marginTop:6}}/></label><button style={action} disabled={busy||!draft.trim()} onClick={()=>void send()}>Send message</button><button style={{...action,background:'#526273'}} disabled={busy} onClick={()=>void openMessages(selected)}>Refresh messages</button></>:<p>Select an assigned job to view or send secure messages.</p>}</section>
+  <section style={panel}><h2>Job alerts ({alerts.length})</h2>{!alerts.length&&<p>No alerts yet.</p>}{alerts.map(a=><p key={a.id} style={{borderTop:'1px solid #e4e8ed',paddingTop:10}}>Work order #{a.request_id} · {a.event_type} <small>({new Date(a.created_at).toLocaleString()})</small></p>)}</section></>:profile?<section style={panel}><h2>Approval pending</h2><p>Home Guardian management must approve your contractor profile before you can access jobs.</p></section>:null}</>}
+  {error&&<p role="alert" style={{color:'#a42323',padding:12}}>{error}</p>}{notice&&<p role="status" style={{color:'#17623d',padding:12}}>{notice}</p>}
+ </main>;
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/admin/page.tsx
+======================================================================
+'use client';
+import {useCallback,useEffect,useState} from 'react';
+import {createClient, type Session} from '@supabase/supabase-js';
+type Metrics={members:number;activeMembers:number;contractors:number;pendingContractors:number;requests:number;openRequests:number;assignedRequests:number};
+type Contractor={user_id:string;approved:boolean;trade:string;service_area:string};
+type History={id:number;request_id:number;contractor_id:string;action:string;actor_id:string;occurred_at:string};
+type Audit={id:number;actor_id:string;action:string;target_type:string;target_id:string;occurred_at:string};
+type Job={id:number;trade:string;description:string;status:string;service_area:string;repair_assignments:{contractor_id:string}|null};
+export default function AdminPage(){
+ const [email,setEmail]=useState(''),[password,setPassword]=useState(''),[loginBusy,setLoginBusy]=useState(false),[token,setToken]=useState(''),[history,setHistory]=useState<History[]>([]),[audits,setAudits]=useState<Audit[]>([]),[metrics,setMetrics]=useState<Metrics|null>(null),[contractors,setContractors]=useState<Contractor[]>([]),[jobs,setJobs]=useState<Job[]>([]),[page,setPage]=useState(1),[total,setTotal]=useState(0),[error,setError]=useState(''),[busy,setBusy]=useState(false);
+ const [authClient]=useState(()=>createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!,process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,{auth:{persistSession:true,autoRefreshToken:true}}));
+ useEffect(()=>{let mounted=true;authClient.auth.getSession().then(({data})=>{if(mounted)setToken(data.session?.access_token||'')});const {data:{subscription}}=authClient.auth.onAuthStateChange((_event,session:Session|null)=>{if(mounted)setToken(session?.access_token||'')});return()=>{mounted=false;subscription.unsubscribe()}},[authClient]);
+ async function login(e:React.FormEvent){e.preventDefault();setError('');setLoginBusy(true);try{const {error}=await authClient.auth.signInWithPassword({email,password});if(error)throw error;setPassword('')}catch(e){setError(e instanceof Error?e.message:'Sign-in failed')}finally{setLoginBusy(false)}}
+ async function logout(){await authClient.auth.signOut();setMetrics(null);setContractors([]);setJobs([]);setHistory([]);setAudits([])}
+ const call=useCallback(async(path:string,options:RequestInit={})=>{
+  const res=await fetch(path,{...options,headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json',...(options.headers||{})},cache:'no-store'});
+  const data=await res.json();if(!res.ok)throw Error(data.error||'Request failed');return data;
+ },[token]);
+ const refresh=useCallback(async()=>{
+  if(!token)return;
+  setBusy(true);setError('');
+  try{
+   const [overview,c,j,h,a]=await Promise.all([call('/api/admin/overview'),call('/api/admin/contractors?page='+page),call('/api/admin/requests?page='+page),call('/api/admin/history?page='+page),call('/api/admin/audit?page='+page)]);
+   setMetrics(overview.metrics);setContractors(c.items);setJobs(j.items);setHistory(h.items);setAudits(a.items);setTotal(Math.max(c.total,j.total,h.total,a.total));
+  }catch(e){setError(e instanceof Error?e.message:'Unable to load dashboard')}finally{setBusy(false)}
+ },[call,page,token]);
+ useEffect(()=>{void refresh()},[refresh]);
+ async function approve(id:string,approved:boolean){try{await call('/api/admin/contractors',{method:'PATCH',body:JSON.stringify({contractorId:id,approved})});await refresh()}catch(e){setError(String(e))}}
+ async function reopen(id:number){if(!confirm('Reopen this work order? The assigned contractor will lose messaging access.'))return;try{const result=await call('/api/admin/reopen',{method:'POST',body:JSON.stringify({requestId:id})});alert(`${result.inAppAlertsCreated} contractor in-app alerts created`);await refresh()}catch(e){setError(String(e))}}
+ const card=(label:string,value:number|undefined)=><div style={{padding:20,border:'1px solid #ccd5e2',borderRadius:12,background:'white'}}><small>{label}</small><h2>{value??'—'}</h2></div>;
+ return <main style={{maxWidth:1120,margin:'auto',padding:24,fontFamily:'Arial,sans-serif',color:'#18304c'}}>
+  <h1>Home Guardian Management</h1><p>Secure operations dashboard · 1,500-member launch target</p>
+  {!token?<form onSubmit={e=>void login(e)} style={{display:'grid',gap:10,maxWidth:420}}>
+   <label>Administrator email<input type="email" autoComplete="username" required value={email} onChange={e=>setEmail(e.target.value)} style={{width:'100%',padding:12}}/></label>
+   <label>Password<input type="password" autoComplete="current-password" required value={password} onChange={e=>setPassword(e.target.value)} style={{width:'100%',padding:12}}/></label>
+   <button disabled={loginBusy} type="submit">{loginBusy?'Signing in…':'Sign in securely'}</button>
+   <p style={{fontSize:13}}>Only accounts listed in the Home Guardian administrator table can access management data. Use a unique administrator password and enable MFA before launch.</p>
+  </form>:<div style={{display:'flex',gap:12}}><button disabled={busy} onClick={()=>void refresh()}>Refresh dashboard</button><button onClick={()=>void logout()}>Sign out</button></div>}
+  {error&&<p role="alert" style={{color:'#b42318'}}>{error}</p>}
+  {token&&<><section style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(160px,1fr))',gap:12,marginTop:24}}>
+   {card('Total members',metrics?.members)}{card('Active paid members',metrics?.activeMembers)}{card('Approved + pending contractors',metrics?.contractors)}{card('Pending approval',metrics?.pendingContractors)}{card('Open work orders',metrics?.openRequests)}{card('Assigned work orders',metrics?.assignedRequests)}
+  </section>
+  <h2>Contractor approvals</h2>
+  <div style={{overflowX:'auto'}}><table style={{width:'100%',textAlign:'left'}}><thead><tr><th>Contractor ID</th><th>Trade</th><th>Service area</th><th>Status</th><th>Action</th></tr></thead><tbody>
+  {contractors.map(c=><tr key={c.user_id}><td>{c.user_id.slice(0,8)}…</td><td>{c.trade}</td><td>{c.service_area}</td><td>{c.approved?'Approved':'Pending'}</td><td><button onClick={()=>void approve(c.user_id,!c.approved)}>{c.approved?'Suspend':'Approve'}</button></td></tr>)}
+  </tbody></table></div>
+  <h2>Work orders</h2>
+  <div style={{overflowX:'auto'}}><table style={{width:'100%',textAlign:'left'}}><thead><tr><th>Order</th><th>Trade</th><th>Area</th><th>Status</th><th>Assigned contractor</th><th>Action</th></tr></thead><tbody>
+  {jobs.map(j=><tr key={j.id}><td>#{j.id}</td><td>{j.trade}</td><td>{j.service_area}</td><td>{j.status}</td><td>{j.repair_assignments?.contractor_id.slice(0,8)??'—'}</td><td>{j.status==='assigned'&&<button onClick={()=>void reopen(j.id)}>Reopen & notify</button>}</td></tr>)}
+  </tbody></table></div>
+  <h2>Contractor acceptance and decline history</h2>
+  <div style={{overflowX:'auto'}}><table style={{width:'100%',textAlign:'left'}}><thead><tr><th>When</th><th>Work order</th><th>Contractor</th><th>Decision</th></tr></thead><tbody>{history.map(h=><tr key={h.id}><td>{new Date(h.occurred_at).toLocaleString()}</td><td>#{h.request_id}</td><td>{h.contractor_id.slice(0,8)}…</td><td>{h.action}</td></tr>)}</tbody></table></div>
+  <h2>Administrative audit log</h2>
+  <div style={{overflowX:'auto'}}><table style={{width:'100%',textAlign:'left'}}><thead><tr><th>When</th><th>Administrator</th><th>Action</th><th>Target</th></tr></thead><tbody>{audits.map(a=><tr key={a.id}><td>{new Date(a.occurred_at).toLocaleString()}</td><td>{a.actor_id.slice(0,8)}…</td><td>{a.action}</td><td>{a.target_type}: {a.target_id.slice(0,12)}</td></tr>)}</tbody></table></div>
+  <div style={{display:'flex',gap:12,marginTop:18}}><button disabled={page<=1} onClick={()=>setPage(p=>p-1)}>Previous</button><span>Page {page}</span><button disabled={page*25>=total} onClick={()=>setPage(p=>p+1)}>Next</button></div>
+ </>}</main>
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/app/layout.tsx
+======================================================================
+import type {ReactNode} from 'react';
+export default function RootLayout({children}:{children:ReactNode}){return <html lang="en"><body style={{margin:0,fontFamily:'system-ui, sans-serif',background:'#f1f5f9',color:'#15324d'}}>{children}</body></html>}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/README.md
+======================================================================
+# Home Guardian starter
+
+A Next.js + Supabase + Stripe foundation for paid homeowner membership, guided maintenance onboarding, and scheduled reminder records.
+
+## Setup
+1. `npm install`
+2. Copy `.env.example` to `.env.local` and fill values.
+3. Run `supabase/schema.sql` in the Supabase SQL editor.
+4. Configure Stripe webhook endpoint `/api/stripe/webhook` for `checkout.session.completed`, `customer.subscription.updated`, and `customer.subscription.deleted`.
+5. Run `npm run dev`.
+6. Schedule `GET /api/cron/reminders` daily using a scheduler, with `Authorization: Bearer <CRON_SECRET>`.
+
+## Scope
+- Authenticated Supabase sessions via bearer access token in API requests.
+- Checkout and subscription status synced by Stripe webhook.
+- Guided setup builds recommended maintenance reminders.
+- Due reminders recorded in notification inbox; email/push delivery is a future integration.
+- Repair request submission requires an active paid membership and is protected in the database.
+
+This starter requires your own Supabase/Stripe credentials and deployment to process real payments. Do not expose service-role or Stripe secret keys to the browser.
+
+## Exclusive contractor assignments (1,500-member readiness)
+1. Run `supabase/exclusive_contractors.sql` after the base schema.
+2. Admin provisions contractor rows with `approved=true`, `trade`, and `service_area` (server-side only).
+3. Homeowner request POST now requires `service_area` as well as trade and description. Update the frontend form to send the homeowner's verified service area.
+4. Contractors call `GET /api/contractor/opportunities` with a Supabase bearer token, then `POST /api/contractor/claim` with `{ "requestId": 123 }`.
+5. Only the homeowner and assigned contractor can access `GET/POST /api/requests/123/messages`.
+6. The database's assignment primary key and atomic claim RPC prevent simultaneous double claims. Admin reassignment requires a separate audited server workflow (not included).
+
+### Capacity notes
+Designed for 1,500 registered members, **not load-tested or production certified**. Use managed Postgres connection pooling, indexes, pagination, queue-based reminders, Stripe webhook idempotency, rate limits, monitoring, and concurrency/load testing before launch. The existing daily reminders route should be refactored to batch work for larger populations. Add authenticated admin approval, more granular service-area matching, abuse protection, and homeowner notification delivery before production.
+
+## Management dashboard add-on
+Visit `/admin` after setting up Supabase and applying `schema.sql`, `exclusive_contractors.sql`, and `secure_reassignment.sql` in that order.
+Add administrator user IDs to `home_guardian_admins` using a privileged SQL editor.
+The dashboard supports aggregate membership metrics, paginated contractor approvals, paginated work orders, and reopen-and-notify using the existing locked database function.
+**Development authentication:** `/admin` currently accepts a Supabase user access token entered manually; it is NOT a production-ready login flow. Only server-side admin-verified endpoints access the service-role database client. Replace this with secure session authentication before launch.
+Contractor alerts are **in-app records only**, not delivered email/push. No deployment, load test, or security audit was executed. See `tests/admin-security-checklist.md`.
+
+## Secure operations extension
+Apply `supabase/operations_security.sql` after the earlier migrations.
+- Assignment history: `GET /api/admin/history`
+- Audit history: `GET /api/admin/audit`
+- Message reads: transactional, assignment-checked RPC; no direct two-query TOCTOU authorization
+- Approvals and reopens: transactional audit events
+- Job reopened: outbox events are created atomically; `/api/cron/deliver` delivers via Resend with retries, leased workers and idempotency keys
+- Configure `RESEND_API_KEY`, verified `NOTIFICATION_FROM_EMAIL`, `CRON_SECRET`, Supabase credentials, and appropriate hosting plan for the five-minute cron.
+- Test: `npm install`, `npm run typecheck`, then `TEST_DATABASE_URL=... npm run test:concurrency` against **disposable seeded test data only**. Tests are skipped when no database URL exists.
+- The existing `/admin` page still uses manual access-token entry and is NOT suitable for production. Complete real admin login, webhook/replay monitoring, rate limiting, and provider delivery validation before accepting customers.
+- Provider acceptance of an email is not proof of inbox delivery. Configure provider webhook delivery/bounce reporting before production.
+
+## Integrated administrator dashboard
+`/admin` now uses Supabase email/password authentication and auto-refreshing sessions, rather than manually pasted tokens. Membership statistics, contractor approvals, work orders, assignment history, and administrator audit logs appear together. Admin access is verified on every API call using `home_guardian_admins`. Configure MFA and session hardening before production.
+
+## Staging test procedure
+1. Create a separate Supabase staging project. Apply migrations in README order and seed synthetic members, two matching approved contractors, and an admin account.
+2. Set the staging environment variables, never production secrets. Run `npm install && npm run typecheck && npm run build`.
+3. Set `TEST_DATABASE_URL` to a **disposable staging** Postgres database, then run `npm run test:concurrency`. The concurrency test creates and deletes its own work order but depends on seeded users.
+4. Set `STAGING_URL` and `STAGING_BEARER_TOKEN` to a staging administrator session; run `npm run test:staging-load`. This sends 1,500 total dashboard requests at 30 concurrency, NOT 1,500 concurrent members. Test real user journeys separately.
+5. Verify authorization failures, stale sessions, reassignment message reads, retry delivery, and audit entries manually or with additional end-to-end tests.
+
+No staging credentials were available in the build environment, so staging tests and live deployment have not been run.
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/tsconfig.json
+======================================================================
+{"compilerOptions":{"target":"ES2017","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}]},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/vercel.json
+======================================================================
+{"crons":[{"path":"/api/cron/reminders","schedule":"0 12 * * *"},{"path":"/api/cron/deliver","schedule":"*/5 * * * *"}]}
+
+======================================================================
+FILE: home-guardian-admin-integrated/lib/schedule.ts
+======================================================================
+export type HomeInput={year_built:number; hvac_type:string; filter_last_changed:string; heater_type:string; heater_last_serviced:string; gutters:boolean};
+const addDays=(date:string,days:number)=>{const d=new Date(`${date}T12:00:00Z`);d.setUTCDate(d.getUTCDate()+days);return d.toISOString().slice(0,10)};
+export function schedule(input:HomeInput){
+ const tasks=[{code:'filter',title:'Check HVAC air filter',frequency_days:60,next_due:addDays(input.filter_last_changed,60),instructions:'Inspect filter and replace as needed. Adjust for manufacturer guidance and household conditions.'},{code:'heater',title:'Check water heater maintenance',frequency_days:365,next_due:addDays(input.heater_last_serviced,365),instructions:'Follow equipment manufacturer guidance. Sediment flushing and descaling needs vary; use a professional when appropriate.'},{code:'alarms',title:'Test smoke and CO alarms',frequency_days:30,next_due:addDays(new Date().toISOString().slice(0,10),30),instructions:'Follow alarm manufacturer testing and replacement instructions.'}];
+ if(input.gutters)tasks.push({code:'gutters',title:'Inspect gutters and downspouts',frequency_days:180,next_due:addDays(new Date().toISOString().slice(0,10),180),instructions:'Check for blockages and drainage issues; avoid unsafe ladder work.'});
+ return tasks;
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/lib/server.ts
+======================================================================
+import { createClient } from '@supabase/supabase-js';
+import Stripe from 'stripe';
+export const db = () => createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {auth:{persistSession:false}});
+export const stripe = () => new Stripe(process.env.STRIPE_SECRET_KEY!);
+export async function currentUser(req: Request) {
+  const token = req.headers.get('authorization')?.replace(/^Bearer\s+/i,'');
+  if (!token) return null;
+  const auth = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!,process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,{auth:{persistSession:false}});
+  const {data,error}=await auth.auth.getUser(token);
+  return error ? null : data.user;
+}
+export async function isActive(userId:string) {
+  const {data}=await db().from('memberships').select('status,paid_through').eq('user_id',userId).maybeSingle();
+  return !!data && (data.status==='active'||data.status==='trialing') && !!data.paid_through && new Date(data.paid_through).getTime()>Date.now();
+}
+export const unauthorized=()=>Response.json({error:'Sign in required'},{status:401});
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/lib/admin.ts
+======================================================================
+import {currentUser,db} from './server';
+export async function requireAdmin(req:Request){
+ const user=await currentUser(req);
+ if(!user) return {error:Response.json({error:'Sign in required'},{status:401})};
+ const {data,error}=await db().from('home_guardian_admins').select('user_id').eq('user_id',user.id).maybeSingle();
+ if(error||!data) return {error:Response.json({error:'Administrator access required'},{status:403})};
+ return {user};
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/package.json
+======================================================================
+{
+  "name": "home-guardian",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test:concurrency": "node --test tests/concurrency.test.mjs",
+    "test:staging-load": "node tests/staging-load.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "next": "^15.3.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "stripe": "^18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.8.0",
+    "pg": "^8.13.0",
+    "@types/pg": "^8.11.0"
+  }
+}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/.env.example
+======================================================================
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+STRIPE_MONTHLY_PRICE_ID=
+STRIPE_ANNUAL_PRICE_ID=
+APP_URL=http://localhost:3000
+CRON_SECRET=
+
+RESEND_API_KEY=
+NOTIFICATION_FROM_EMAIL=
+TEST_DATABASE_URL=
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/tests/load.js
+======================================================================
+// Run: BASE_URL=https://your-domain TOKEN=... k6 run -e BASE_URL=$BASE_URL -e TOKEN=$TOKEN tests/load.js
+// Requires a staging contractor account with approved status and seeded requests.
+import http from 'k6/http';
+import {check,sleep} from 'k6';
+export const options={scenarios:{members:{executor:'ramping-vus',startVUs:0,stages:[{duration:'1m',target:50},{duration:'3m',target:150},{duration:'1m',target:0}]}},thresholds:{http_req_failed:['rate<0.01'],http_req_duration:['p(95)<1000']}};
+export default function(){const r=http.get(`${__ENV.BASE_URL}/api/contractor/opportunities`,{headers:{Authorization:`Bearer ${__ENV.TOKEN}`}});check(r,{'response 200':x=>x.status===200});sleep(2);}
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/tests/concurrency.test.mjs
+======================================================================
+// Run against a disposable Supabase/Postgres test database only.
+// DATABASE_URL must be a Postgres connection string with rights to create test fixtures.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import pg from 'pg';
+const {Pool}=pg;
+const enabled=Boolean(process.env.TEST_DATABASE_URL);
+const pool=enabled?new Pool({connectionString:process.env.TEST_DATABASE_URL,max:15}):null;
+test('simultaneous contractor claims yield exactly one winner and one acceptance history event',{skip:!enabled},async()=>{
+ const client=await pool.connect();
+ let requestId;
+ try{
+  await client.query('begin');
+  const ids=await client.query("select c.user_id,c.trade,c.service_area from public.contractors c where c.approved group by c.user_id,c.trade,c.service_area having count(*)=1 limit 20");
+  const pair=ids.rows.find(a=>ids.rows.some(b=>a.user_id!==b.user_id&&a.trade===b.trade&&a.service_area===b.service_area));
+  if(!pair)throw Error('Seed two approved contractors with matching trade and service area');
+  const others=ids.rows.filter(x=>x.trade===pair.trade&&x.service_area===pair.service_area&&x.user_id!==pair.user_id);
+  const homeowner=await client.query("select user_id from public.memberships limit 1");
+  if(!homeowner.rows.length)throw Error('Seed a homeowner membership');
+  const created=await client.query("insert into public.repair_requests(user_id,trade,service_area,description,status) values($1,$2,$3,'concurrency test','open') returning id",[homeowner.rows[0].user_id,pair.trade,pair.service_area]);
+  requestId=created.rows[0].id;
+  await client.query('commit');
+  const contenders=[pair.user_id,others[0].user_id];
+  const results=await Promise.all(contenders.map(async id=>{
+   const c=await pool.connect();try{return (await c.query('select public.claim_repair($1,$2) as claimed',[requestId,id])).rows[0].claimed}finally{c.release()}
+  }));
+  assert.equal(results.filter(Boolean).length,1);
+  const rows=await pool.query("select * from public.contractor_assignment_history where request_id=$1 and action='accepted'",[requestId]);
+  assert.equal(rows.rowCount,1);
+  const winner=await pool.query('select contractor_id from public.repair_assignments where request_id=$1',[requestId]);
+  assert.equal(winner.rowCount,1);
+  const homeownerId=homeowner.rows[0].user_id;
+  const outcomes=await Promise.allSettled([
+   pool.query('select public.send_repair_message($1,$2,$3)',[requestId,homeownerId,'racing message']),
+   pool.query('select public.reopen_repair($1,$2)',[requestId,winner.rows[0].contractor_id])
+  ]);
+  assert.equal(outcomes.length,2);
+  const after=await pool.query('select * from public.repair_messages where request_id=$1',[requestId]);
+  assert.equal(after.rowCount,0,'reopening must delete earlier messages even during race');
+  await assert.rejects(pool.query('select * from public.read_repair_messages($1,$2,100)',[requestId,winner.rows[0].contractor_id]));
+ }finally{
+  if(requestId)await pool.query('delete from public.repair_requests where id=$1',[requestId]);
+  client.release();
+ }
+});
+process.on('beforeExit',()=>pool?.end());
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/tests/staging-load.mjs
+======================================================================
+// Staging-only load probe: run with STAGING_URL and STAGING_BEARER_TOKEN.
+// Does not simulate 1,500 simultaneous users: 1,500 iterations with bounded concurrency.
+import assert from 'node:assert/strict';
+const url=process.env.STAGING_URL,token=process.env.STAGING_BEARER_TOKEN;
+if(!url||!token)throw Error('Set STAGING_URL and STAGING_BEARER_TOKEN for a disposable staging environment');
+const total=1500, concurrency=30, latencies=[], errors=[];let index=0;
+async function worker(){while(index<total){index++;const start=performance.now();try{const r=await fetch(new URL('/api/admin/overview',url),{headers:{Authorization:`Bearer ${token}`}});if(!r.ok)errors.push(r.status);else await r.json()}catch(e){errors.push(String(e))}latencies.push(performance.now()-start)}}
+await Promise.all(Array.from({length:concurrency},worker));latencies.sort((a,b)=>a-b);
+console.log(JSON.stringify({requests:total,concurrency,errors:errors.length,p50_ms:latencies[Math.floor(total*.5)],p95_ms:latencies[Math.floor(total*.95)],p99_ms:latencies[Math.floor(total*.99)]},null,2));
+assert.equal(errors.length,0,'Staging probe encountered failures');
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/tests/admin-security-checklist.md
+======================================================================
+# Home Guardian production acceptance checklist
+- [ ] Admin token valid, revoked, expired, and non-admin access tests on all four endpoints
+- [ ] Contractor approval and suspension permission tests
+- [ ] Concurrent claim vs claim, claim vs reopen, message vs reopen, and message GET vs reopen
+- [ ] Ensure previous contractor cannot read or send messages after reassignment
+- [ ] Add audit logs and rate limits for approval/reopen actions
+- [ ] Replace development token input with secure Supabase session login
+- [ ] Queue email/push alerts with retries, deduplication, and delivery observability
+- [ ] Batch reminders, test Stripe webhook idempotency and retry handling
+- [ ] Run staging load tests with 1,500 seeded member records and realistic traffic
+- [ ] Configure Vercel environment, Supabase backups, monitoring, and incident alerts
+- [ ] Validate RLS, secrets, dependency versions, and privacy/security review
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/supabase/exclusive_contractors.sql
+======================================================================
+-- Run AFTER schema.sql. Atomic claim prevents double assignment even under concurrency.
+create table if not exists public.contractors (
+ user_id uuid primary key references auth.users(id) on delete cascade,
+ approved boolean not null default false,
+ trade text not null check(trade in ('plumbing','hvac','electrical','roofing','general')),
+ service_area text not null,
+ created_at timestamptz not null default now()
+);
+-- One active contractor per repair request, enforced by primary key.
+create table if not exists public.repair_assignments (
+ request_id bigint primary key references public.repair_requests(id) on delete cascade,
+ contractor_id uuid not null references public.contractors(user_id),
+ assigned_at timestamptz not null default now()
+);
+create table if not exists public.repair_messages (
+ id bigint generated always as identity primary key,
+ request_id bigint not null references public.repair_assignments(request_id) on delete cascade,
+ sender_id uuid not null references auth.users(id),
+ body text not null check(char_length(body) between 1 and 2000),
+ created_at timestamptz not null default now()
+);
+-- Service area must be set when a homeowner creates a request. Existing requests
+-- without service areas will not be offered until an admin fills it in.
+alter table public.repair_requests add column if not exists service_area text;
+create index if not exists repair_requests_open_trade_area_idx on public.repair_requests(trade,service_area,created_at) where status='open';
+create index if not exists repair_messages_request_idx on public.repair_messages(request_id,created_at);
+create index if not exists repair_assignments_contractor_idx on public.repair_assignments(contractor_id);
+alter table public.contractors enable row level security;
+alter table public.repair_assignments enable row level security;
+alter table public.repair_messages enable row level security;
+-- No browser access: use server endpoints with verified Supabase auth.
+-- Only server role can call this function; a single INSERT ON CONFLICT is atomic.
+create or replace function public.claim_repair(p_request_id bigint,p_contractor_id uuid)
+returns boolean language plpgsql security definer set search_path=public as $$
+declare v_claimed bigint;
+begin
+  insert into public.repair_assignments(request_id,contractor_id)
+  select r.id, c.user_id from public.repair_requests r
+  join public.contractors c on c.user_id=p_contractor_id
+  where r.id=p_request_id and r.status='open' and c.approved
+    and c.trade=r.trade and c.service_area=r.service_area
+  on conflict(request_id) do nothing returning request_id into v_claimed;
+  if v_claimed is null then return false; end if;
+  update public.repair_requests set status='assigned' where id=p_request_id;
+  return true;
+end $$;
+revoke all on function public.claim_repair(bigint,uuid) from public,anon,authenticated;
+grant execute on function public.claim_repair(bigint,uuid) to service_role;
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/supabase/schema.sql
+======================================================================
+create table public.memberships (user_id uuid primary key references auth.users(id) on delete cascade, stripe_subscription_id text unique, status text not null default 'inactive', plan text check(plan in ('monthly','annual')), paid_through timestamptz, updated_at timestamptz default now());
+create table public.homes (user_id uuid primary key references auth.users(id) on delete cascade, year_built int not null, hvac_type text not null, filter_last_changed date not null, heater_type text not null, heater_last_serviced date not null, gutters boolean not null);
+create table public.maintenance_tasks (id bigint generated always as identity primary key, user_id uuid not null references auth.users(id) on delete cascade, code text not null, title text not null, frequency_days int not null, next_due date not null, instructions text not null, unique(user_id,code));
+create table public.notifications (id bigint generated always as identity primary key, user_id uuid not null references auth.users(id) on delete cascade, task_id bigint not null references public.maintenance_tasks(id) on delete cascade, reminder_date date not null, title text not null, body text not null, created_at timestamptz default now(), read_at timestamptz, unique(task_id,reminder_date));
+create table public.repair_requests (id bigint generated always as identity primary key, user_id uuid not null references auth.users(id) on delete cascade, trade text not null, description text not null, status text not null default 'open', created_at timestamptz default now());
+-- Disable direct browser writes to protected tables. API uses server-only service role.
+alter table public.memberships enable row level security;
+alter table public.homes enable row level security;
+alter table public.maintenance_tasks enable row level security;
+alter table public.notifications enable row level security;
+alter table public.repair_requests enable row level security;
+-- No public policies: authenticated browser clients cannot read or mutate these tables directly.
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/supabase/secure_reassignment.sql
+======================================================================
+-- Run after schema.sql and exclusive_contractors.sql.
+-- All changes to assignments and messages are serialized on the repair request row.
+create table if not exists public.home_guardian_admins (
+ user_id uuid primary key references auth.users(id) on delete cascade
+);
+create table if not exists public.contractor_alerts (
+ id bigint generated always as identity primary key,
+ contractor_id uuid not null references public.contractors(user_id),
+ request_id bigint not null references public.repair_requests(id) on delete cascade,
+ event_type text not null check (event_type in ('reopened')),
+ created_at timestamptz not null default now(),
+ read_at timestamptz,
+ unique(contractor_id,request_id,event_type,created_at)
+);
+create index if not exists contractor_alerts_inbox_idx on public.contractor_alerts(contractor_id,created_at desc);
+alter table public.home_guardian_admins enable row level security;
+alter table public.contractor_alerts enable row level security;
+-- Locking request rows makes claims, releases, and message inserts mutually exclusive.
+create or replace function public.claim_repair(p_request_id bigint,p_contractor_id uuid)
+returns boolean language plpgsql security definer set search_path=public as $$
+declare r public.repair_requests%rowtype;
+begin
+ select * into r from public.repair_requests where id=p_request_id for update;
+ if not found or r.status <> 'open' then return false; end if;
+ if not exists(select 1 from public.contractors c where c.user_id=p_contractor_id and c.approved and c.trade=r.trade and c.service_area=r.service_area) then return false; end if;
+ insert into public.repair_assignments(request_id,contractor_id) values(p_request_id,p_contractor_id) on conflict do nothing;
+ if not found then return false; end if;
+ update public.repair_requests set status='assigned' where id=p_request_id;
+ return true;
+end $$;
+-- Contractor can decline their own job; an administrator may reopen any assignment.
+-- The original contractor is excluded from this reopening notification batch.
+create or replace function public.reopen_repair(p_request_id bigint,p_actor_id uuid)
+returns integer language plpgsql security definer set search_path=public as $$
+declare r public.repair_requests%rowtype; old_contractor uuid; n integer;
+begin
+ select * into r from public.repair_requests where id=p_request_id for update;
+ if not found then raise exception 'Request not found'; end if;
+ select contractor_id into old_contractor from public.repair_assignments where request_id=p_request_id;
+ if old_contractor is null or r.status <> 'assigned' then raise exception 'Request not assigned'; end if;
+ if p_actor_id <> old_contractor and not exists(select 1 from public.home_guardian_admins where user_id=p_actor_id) then raise exception 'Not authorized'; end if;
+ -- Delete previous conversation so the next contractor cannot read old messages.
+ delete from public.repair_messages where request_id=p_request_id;
+ delete from public.repair_assignments where request_id=p_request_id;
+ update public.repair_requests set status='open' where id=p_request_id;
+ insert into public.contractor_alerts(contractor_id,request_id,event_type)
+ select c.user_id,p_request_id,'reopened' from public.contractors c
+ where c.approved and c.trade=r.trade and c.service_area=r.service_area and c.user_id<>old_contractor;
+ get diagnostics n=row_count;
+ return n;
+end $$;
+-- Message authorization and insert must happen inside the same row lock as reassignment.
+create or replace function public.send_repair_message(p_request_id bigint,p_sender_id uuid,p_body text)
+returns bigint language plpgsql security definer set search_path=public as $$
+declare r public.repair_requests%rowtype; assigned uuid; message_id bigint;
+begin
+ if length(trim(coalesce(p_body,''))) not between 1 and 2000 then raise exception 'Invalid message'; end if;
+ select * into r from public.repair_requests where id=p_request_id for update;
+ if not found or r.status <> 'assigned' then raise exception 'Request unavailable'; end if;
+ select contractor_id into assigned from public.repair_assignments where request_id=p_request_id;
+ if assigned is null or (p_sender_id <> assigned and p_sender_id <> r.user_id) then raise exception 'Access denied'; end if;
+ insert into public.repair_messages(request_id,sender_id,body) values(p_request_id,p_sender_id,trim(p_body)) returning id into message_id;
+ return message_id;
+end $$;
+revoke all on function public.claim_repair(bigint,uuid) from public,anon,authenticated;
+revoke all on function public.reopen_repair(bigint,uuid) from public,anon,authenticated;
+revoke all on function public.send_repair_message(bigint,uuid,text) from public,anon,authenticated;
+grant execute on function public.claim_repair(bigint,uuid) to service_role;
+grant execute on function public.reopen_repair(bigint,uuid) to service_role;
+grant execute on function public.send_repair_message(bigint,uuid,text) to service_role;
+
+
+======================================================================
+FILE: home-guardian-admin-integrated/supabase/operations_security.sql
+======================================================================
+-- Apply AFTER secure_reassignment.sql. Back up production data first.
+create table if not exists public.contractor_assignment_history(
+ id bigint generated always as identity primary key,
+ request_id bigint not null references public.repair_requests(id) on delete cascade,
+ contractor_id uuid not null references public.contractors(user_id),
+ action text not null check(action in ('accepted','declined','admin_reopened')),
+ actor_id uuid not null references auth.users(id),
+ occurred_at timestamptz not null default now()
+);
+create index if not exists assignment_history_request_idx on public.contractor_assignment_history(request_id,occurred_at desc);
+create table if not exists public.admin_audit_logs(
+ id bigint generated always as identity primary key,
+ actor_id uuid not null references auth.users(id),
+ action text not null,
+ target_type text not null,
+ target_id text not null,
+ details jsonb not null default '{}'::jsonb,
+ occurred_at timestamptz not null default now()
+);
+create index if not exists audit_occurred_idx on public.admin_audit_logs(occurred_at desc);
+create table if not exists public.notification_outbox(
+ id bigint generated always as identity primary key,
+ recipient_id uuid not null references auth.users(id),
+ request_id bigint references public.repair_requests(id) on delete cascade,
+ kind text not null,
+ event_key text not null unique,
+ email text,
+ subject text not null,
+ body text not null,
+ status text not null default 'pending' check(status in ('pending','processing','sent','failed')),
+ attempts int not null default 0,
+ next_attempt_at timestamptz not null default now(),
+ lease_until timestamptz,
+ delivered_at timestamptz,
+ last_error text,
+ created_at timestamptz not null default now()
+);
+create index if not exists outbox_pending_idx on public.notification_outbox(status,next_attempt_at);
+alter table public.contractor_assignment_history enable row level security;
+alter table public.admin_audit_logs enable row level security;
+alter table public.notification_outbox enable row level security;
+-- Existing repair_messages is intentionally deleted on reassignment; protect read with the SAME lock.
+create or replace function public.read_repair_messages(p_request_id bigint,p_reader_id uuid,p_limit int default 100)
+returns table(id bigint,sender_id uuid,body text,created_at timestamptz)
+language plpgsql security definer set search_path=public as $$
+declare r public.repair_requests%rowtype; assigned uuid;
+begin
+ select * into r from public.repair_requests rr where rr.id=p_request_id for share;
+ if not found or r.status<>'assigned' then raise exception 'Access denied'; end if;
+ select a.contractor_id into assigned from public.repair_assignments a where a.request_id=p_request_id;
+ if assigned is null or p_reader_id<>r.user_id and p_reader_id<>assigned then raise exception 'Access denied'; end if;
+ return query select m.id,m.sender_id,m.body,m.created_at from public.repair_messages m
+ where m.request_id=p_request_id order by m.created_at desc limit least(greatest(p_limit,1),100);
+end $$;
+-- Lock request row for all assignment transitions; history and alerts commit atomically.
+create or replace function public.claim_repair(p_request_id bigint,p_contractor_id uuid)
+returns boolean language plpgsql security definer set search_path=public as $$
+declare r public.repair_requests%rowtype;
+begin
+ select * into r from public.repair_requests where id=p_request_id for update;
+ if not found or r.status<>'open' then return false; end if;
+ if not exists(select 1 from public.contractors c where c.user_id=p_contractor_id and c.approved and c.trade=r.trade and c.service_area=r.service_area) then return false; end if;
+ insert into public.repair_assignments(request_id,contractor_id) values(p_request_id,p_contractor_id) on conflict do nothing;
+ if not found then return false; end if;
+ update public.repair_requests set status='assigned' where id=p_request_id;
+ insert into public.contractor_assignment_history(request_id,contractor_id,action,actor_id)
+ values(p_request_id,p_contractor_id,'accepted',p_contractor_id);
+ return true;
+end $$;
+create or replace function public.reopen_repair(p_request_id bigint,p_actor_id uuid)
+returns integer language plpgsql security definer set search_path=public as $$
+declare r public.repair_requests%rowtype; old_contractor uuid; n integer; is_admin boolean;
+begin
+ select * into r from public.repair_requests where id=p_request_id for update;
+ if not found or r.status<>'assigned' then raise exception 'Request unavailable'; end if;
+ select contractor_id into old_contractor from public.repair_assignments where request_id=p_request_id;
+ if old_contractor is null then raise exception 'Assignment missing'; end if;
+ select exists(select 1 from public.home_guardian_admins where user_id=p_actor_id) into is_admin;
+ if p_actor_id<>old_contractor and not is_admin then raise exception 'Not authorized'; end if;
+ insert into public.contractor_assignment_history(request_id,contractor_id,action,actor_id)
+ values(p_request_id,old_contractor,case when is_admin and p_actor_id<>old_contractor then 'admin_reopened' else 'declined' end,p_actor_id);
+ if is_admin and p_actor_id<>old_contractor then
+  insert into public.admin_audit_logs(actor_id,action,target_type,target_id,details)
+  values(p_actor_id,'reopen_request','repair_request',p_request_id::text,jsonb_build_object('previous_contractor',old_contractor));
+ end if;
+ delete from public.repair_messages where request_id=p_request_id;
+ delete from public.repair_assignments where request_id=p_request_id;
+ update public.repair_requests set status='open' where id=p_request_id;
+ -- No homeowner private details in these alerts; only the work order reference.
+ insert into public.contractor_alerts(contractor_id,request_id,event_type)
+ select c.user_id,p_request_id,'reopened' from public.contractors c
+ where c.approved and c.trade=r.trade and c.service_area=r.service_area and c.user_id<>old_contractor;
+ get diagnostics n=row_count;
+ insert into public.notification_outbox(recipient_id,request_id,kind,event_key,subject,body)
+ select c.user_id,p_request_id,'job_reopened',
+ 'job-reopened:'||p_request_id||':'||extract(epoch from clock_timestamp())::bigint||':'||c.user_id,
+ 'Home Guardian: job available','An eligible work order is available in your contractor dashboard.'
+ from public.contractors c where c.approved and c.trade=r.trade and c.service_area=r.service_area and c.user_id<>old_contractor;
+ return n;
+end $$;
+create or replace function public.set_contractor_approval(p_actor_id uuid,p_contractor_id uuid,p_approved boolean)
+returns boolean language plpgsql security definer set search_path=public as $$
+begin
+ if not exists(select 1 from public.home_guardian_admins where user_id=p_actor_id) then raise exception 'Not authorized'; end if;
+ update public.contractors set approved=p_approved where user_id=p_contractor_id;
+ if not found then return false; end if;
+ insert into public.admin_audit_logs(actor_id,action,target_type,target_id,details)
+ values(p_actor_id,case when p_approved then 'approve_contractor' else 'suspend_contractor' end,
+ 'contractor',p_contractor_id::text,jsonb_build_object('approved',p_approved));
+ return true;
+end $$;
+-- Queue claiming via SKIP LOCKED to allow parallel workers.
+create or replace function public.lease_notification_batch(p_limit int default 50)
+returns setof public.notification_outbox language plpgsql security definer set search_path=public as $$
+begin
+ return query with selected as (
+  select o.id from public.notification_outbox o
+  where ((o.status='pending' and o.next_attempt_at<=now())
+  or (o.status='processing' and o.lease_until<now()))
+  and o.attempts<8
+  order by o.created_at for update skip locked limit least(greatest(p_limit,1),100)
+ ), updated as (
+  update public.notification_outbox o set status='processing',attempts=o.attempts+1,lease_until=now()+interval '2 minutes'
+  from selected s where o.id=s.id returning o.*
+ ) select * from updated;
+end $$;
+-- Restrict all privileged functions to server-side service role.
+revoke all on function public.read_repair_messages(bigint,uuid,int) from public,anon,authenticated;
+revoke all on function public.claim_repair(bigint,uuid) from public,anon,authenticated;
+revoke all on function public.reopen_repair(bigint,uuid) from public,anon,authenticated;
+revoke all on function public.set_contractor_approval(uuid,uuid,boolean) from public,anon,authenticated;
+revoke all on function public.lease_notification_batch(int) from public,anon,authenticated;
+grant execute on function public.read_repair_messages(bigint,uuid,int) to service_role;
+grant execute on function public.claim_repair(bigint,uuid) to service_role;
+grant execute on function public.reopen_repair(bigint,uuid) to service_role;
+grant execute on function public.set_contractor_approval(uuid,uuid,boolean) to service_role;
+grant execute on function public.lease_notification_batch(int) to service_role;
+
