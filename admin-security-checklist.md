@@ -1,0 +1,12 @@
+# Home Guardian production acceptance checklist
+- [ ] Admin token valid, revoked, expired, and non-admin access tests on all four endpoints
+- [ ] Contractor approval and suspension permission tests
+- [ ] Concurrent claim vs claim, claim vs reopen, message vs reopen, and message GET vs reopen
+- [ ] Ensure previous contractor cannot read or send messages after reassignment
+- [ ] Add audit logs and rate limits for approval/reopen actions
+- [ ] Replace development token input with secure Supabase session login
+- [ ] Queue email/push alerts with retries, deduplication, and delivery observability
+- [ ] Batch reminders, test Stripe webhook idempotency and retry handling
+- [ ] Run staging load tests with 1,500 seeded member records and realistic traffic
+- [ ] Configure Vercel environment, Supabase backups, monitoring, and incident alerts
+- [ ] Validate RLS, secrets, dependency versions, and privacy/security review
